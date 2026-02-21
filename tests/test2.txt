@@ -1,0 +1,118 @@
+TEST 2 — Pending TTL Auto-cancel + pending_oldest_seconds + pending gauge
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================================
+# TEST 2 — Pending TTL Auto-cancel + pending_oldest_seconds + pending gauge
+# Aging real + auto-policy + Prometheus
+# =========================================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+METRICS_URL="${METRICS_URL:-$BASE_URL/metrics}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+RUNBOOK="${RUNBOOK:-restart_service}"
+TARGET_SERVICE="${TARGET_SERVICE:-frontend}"
+
+# Ajusta según tu sistema:
+SLEEP_TO_CROSS_OLDEST_SECONDS="${SLEEP_TO_CROSS_OLDEST_SECONDS:-4}"  # para que pending_oldest_seconds sea >= 3
+SLEEP_TO_ALLOW_TTL_CANCEL_SEC="${SLEEP_TO_ALLOW_TTL_CANCEL_SEC:-8}"  # tiempo para que corra el TTL auto-cancel
+
+die() { echo "❌ $*" >&2; exit 1; }
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-25}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable at $url after ${seconds}s"
+}
+
+# Extrae métrica simple del formato:
+# metric_name <value>
+get_metric_value() {
+  local metrics_text="$1"
+  local metric_name="$2"
+  # awk: busca línea exacta que empieza por el nombre y toma el último campo como valor
+  echo "$metrics_text" | awk -v m="$metric_name" '$1==m {print $2; exit}'
+}
+
+echo "==> Waiting API up..."
+wait_http "$BASE_URL/health" 25
+
+# 1) crear pending (sin confirm)
+incident_id="test-incident-ttl-$(uuidgen | tr -d '-')"
+body="$(jq -n \
+  --arg iid "$incident_id" \
+  --arg svc "$TARGET_SERVICE" \
+  '{incident_id:$iid, target_service:$svc, triggered_by:"system"}')"
+
+echo "STEP 1: Create pending..."
+resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$body" \
+  "$BASE_URL/api/runbooks/$RUNBOOK")"
+
+status="$(echo "$resp" | jq -r '.status // empty')"
+[[ "$status" == "pending" ]] || die "Expected pending, got $status"
+
+execution_id="$(echo "$resp" | jq -r '.execution_id // empty')"
+assert_nonempty "$execution_id" "Missing execution_id"
+echo "OK pending executionId=$execution_id"
+
+# 2) esperar a cruzar threshold para pending_oldest_seconds
+echo "STEP 2: Wait to cross oldest threshold..."
+sleep "$SLEEP_TO_CROSS_OLDEST_SECONDS"
+
+# 3) pending_oldest_seconds >= 3
+echo "STEP 3: Validate pending_oldest_seconds..."
+metrics="$(curl -fsS "$METRICS_URL")"
+oldest="$(get_metric_value "$metrics" "incident_bot_runbooks_pending_oldest_seconds")"
+assert_nonempty "$oldest" "Metric pending_oldest_seconds not found"
+
+# Compara como número (awk)
+awk -v v="$oldest" 'BEGIN{ exit !(v >= 3) }' || die "Expected pending_oldest_seconds >= 3, got $oldest"
+echo "OK pending_oldest_seconds=$oldest"
+
+# 4) esperar TTL auto-cancel
+echo "STEP 4: Wait TTL auto-cancel..."
+sleep "$SLEEP_TO_ALLOW_TTL_CANCEL_SEC"
+
+# 5) ya no está pending
+echo "STEP 5: Validate execution not in pending list..."
+pending_list="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/pending")"
+
+# tolera dos shapes comunes:
+# - pending[] items con pending_execution_id
+# - pending[] items con id
+still_pending="$(echo "$pending_list" | jq -r --arg eid "$execution_id" '
+  (.pending // []) | any(.pending_execution_id==$eid or .id==$eid)
+')"
+
+[[ "$still_pending" == "false" ]] || die "Execution still pending after TTL (executionId=$execution_id)"
+echo "OK: execution not in pending list (TTL worked)"
+
+# 6) gauge pending (best-effort): no necesariamente 0 si hay otros pendientes
+echo "STEP 6: Validate pending gauge is present..."
+metrics2="$(curl -fsS "$METRICS_URL")"
+pending_gauge="$(get_metric_value "$metrics2" "incident_bot_runbooks_pending")"
+assert_nonempty "$pending_gauge" "Metric pending gauge not found"
+echo "OK pending gauge present: incident_bot_runbooks_pending=$pending_gauge"
+
+echo
+
+QUE HACE: 
+crea un pending, espera a que la métrica pending_oldest_seconds refleje envejecimiento, 
+luego espera a que el TTL lo auto-cancele y verifica que desaparece del endpoint /api/runbooks/pending. 
+Además verifica que existe el gauge incident_bot_runbooks_pending.
+
+echo "TEST 2 PASSED ✅"
