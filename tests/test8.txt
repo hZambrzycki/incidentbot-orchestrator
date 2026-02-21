@@ -1,0 +1,255 @@
+Stale Pending TTL Scheduler Test v8
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================
+# Stale Pending TTL Scheduler Test v8 (bash, paste-safe)
+# - Injects stale PENDING into DB (runbook_executions + runbook_confirmations)
+# - Waits scheduler to auto-cancel => SKIPPED
+# - Verifies BOTH tables updated coherently
+# DB-aware via python sqlite3 inside container
+# =========================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+API_SERVICE="${API_SERVICE:-incident-bot}"
+DB_PATH="${DB_PATH:-/data/incident-bot.sqlite3}"
+
+WAIT_API_SECONDS="${WAIT_API_SECONDS:-30}"
+WAIT_SCHEDULER_SECONDS="${WAIT_SCHEDULER_SECONDS:-240}"
+POLL_INTERVAL_MS="${POLL_INTERVAL_MS:-750}"
+
+RUNBOOK_NAME="${RUNBOOK_NAME:-restart_service}"
+ALLOWED_SERVICE="${ALLOWED_SERVICE:-payments-api}" # allowed service string; doesn't have to exist for this DB test
+
+HEALTH_URL="${HEALTH_URL:-$BASE_URL/api/health}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+ok() { echo "OK $*"; }
+
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-30}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable: $url"
+}
+
+sleep_ms() {
+  local ms="$1"
+  # portable-ish: prefer python if available (host), else approximate with sleep seconds
+  if command -v python >/dev/null 2>&1; then
+    python - <<PY
+import time
+time.sleep(${ms}/1000.0)
+PY
+  else
+    # fallback (coarser)
+    sleep 1
+  fi
+}
+
+# ---------- DB helpers (python sqlite3 inside container) ----------
+
+sqlite_query_json() {
+  local sql="$1"
+  local py='import json,sqlite3,sys
+db_path=sys.argv[1]
+sql=sys.argv[2]
+con=sqlite3.connect(db_path)
+con.row_factory=sqlite3.Row
+rows=[dict(r) for r in con.execute(sql).fetchall()]
+print(json.dumps(rows))'
+  docker compose exec -T "$API_SERVICE" python -c "$py" "$DB_PATH" "$sql"
+}
+
+sqlite_exec_b64() {
+  # Execute script safely by base64-encoding it to avoid quoting issues
+  local sql="$1"
+  local b64
+  b64="$(printf "%s" "$sql" | base64 | tr -d '\n')"
+
+  local py='import base64,sqlite3,sys
+db_path=sys.argv[1]
+b64=sys.argv[2]
+sql=base64.b64decode(b64).decode("utf-8")
+con=sqlite3.connect(db_path)
+cur=con.cursor()
+cur.executescript(sql)
+con.commit()
+con.close()
+sys.stdout.write("OK\n")'
+
+  docker compose exec -T "$API_SERVICE" python -c "$py" "$DB_PATH" "$b64"
+}
+
+dump_exec_by_id() {
+  local execution_id="$1"
+  echo
+  echo "--- DB dump: runbook_executions for exec $execution_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT id,incident_id,runbook_name,status,triggered_by,execution_origin,target_service,error,started_at,completed_at
+                             FROM runbook_executions WHERE id='$execution_id' LIMIT 1;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[0] |
+    "- id=\(.id) incident_id=\(.incident_id) rb=\(.runbook_name) st=\(.status) trig=\(.triggered_by) origin=\(.execution_origin) svc=\(.target_service) started_at=\(.started_at) completed_at=\(.completed_at) err=\(.error)"'
+}
+
+dump_confirm_by_pending() {
+  local pending_id="$1"
+  echo
+  echo "--- DB dump: runbook_confirmations for pending $pending_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT pending_execution_id,incident_id,runbook_name,status,actor_id,confirmed_execution_id,created_at,updated_at
+                             FROM runbook_confirmations WHERE pending_execution_id='$pending_id'
+                             ORDER BY created_at DESC LIMIT 5;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[] |
+    "- pending=\(.pending_execution_id) incident_id=\(.incident_id) rb=\(.runbook_name) st=\(.status) actor=\(.actor_id) confirmed=\(.confirmed_execution_id) created_at=\(.created_at) updated_at=\(.updated_at)"'
+}
+
+# ---------------------------
+# 0) Preflight
+# ---------------------------
+
+echo
+echo "==> Waiting API..."
+wait_http "$HEALTH_URL" "$WAIT_API_SECONDS"
+
+echo
+echo "==> Checking DB presence..."
+db_ls="$(docker compose exec -T "$API_SERVICE" sh -lc "ls -lah '$DB_PATH' || true")"
+echo "$db_ls" | grep -q "incident-bot\.sqlite3" || die "DB file not found at $DB_PATH"
+ok "DB present: $DB_PATH"
+
+# ---------------------------
+# 1) Inject stale pending into DB
+# ---------------------------
+
+echo
+echo "==> [1] Injecting stale PENDING into DB..."
+
+inject_exec_id="$(python - <<'PY'
+import uuid
+print(uuid.uuid4().hex[:8])
+PY
+)"
+incident_id="test-ttl-${inject_exec_id}"
+
+# staleIso: now - 2 days in ISO8601 with Z
+stale_iso="$(python - <<'PY'
+from datetime import datetime, timedelta, timezone
+print((datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace("+00:00","Z"))
+PY
+)"
+payload_json="{}"
+
+cleanup_sql="
+DELETE FROM runbook_confirmations WHERE pending_execution_id='${inject_exec_id}';
+DELETE FROM runbook_executions     WHERE id='${inject_exec_id}';
+"
+# best-effort cleanup
+sqlite_exec_b64 "$cleanup_sql" >/dev/null 2>&1 || true
+
+inject_sql="
+INSERT INTO runbook_executions(
+  id, incident_id, runbook_name, status, triggered_by,
+  execution_origin, retry_of_execution_id,
+  target_service, target_instance, parameters_json,
+  output, error, started_at, completed_at, duration_seconds,
+  confirmed_execution_id, confirmed_by, confirmed_at
+)
+VALUES(
+  '${inject_exec_id}', '${incident_id}', '${RUNBOOK_NAME}', 'pending', 'system',
+  'system', NULL,
+  '${ALLOWED_SERVICE}', NULL, '${payload_json}',
+  '', NULL, '${stale_iso}', NULL, NULL,
+  NULL, NULL, NULL
+);
+
+INSERT INTO runbook_confirmations(
+  pending_execution_id, incident_id, runbook_name, actor_id,
+  status, confirmed_execution_id, created_at, updated_at, result_json
+)
+VALUES(
+  '${inject_exec_id}', '${incident_id}', '${RUNBOOK_NAME}', 'system',
+  'pending', NULL, '${stale_iso}', '${stale_iso}', NULL
+);
+"
+
+echo "DB inject: $(sqlite_exec_b64 "$inject_sql" | tr -d '\r' | tail -n 1)"
+
+chk="$(sqlite_query_json "SELECT id,status,started_at,incident_id FROM runbook_executions WHERE id='${inject_exec_id}' LIMIT 1;")"
+chk_c="$(sqlite_query_json "SELECT pending_execution_id,status,created_at,updated_at,incident_id
+                            FROM runbook_confirmations WHERE pending_execution_id='${inject_exec_id}' LIMIT 1;")"
+
+[[ "$(echo "$chk" | jq 'length')" -eq 1 ]] || die "FAIL: injection did not create runbook_executions row"
+[[ "$(echo "$chk_c" | jq 'length')" -eq 1 ]] || die "FAIL: injection did not create runbook_confirmations row"
+
+exec_st="$(echo "$chk" | jq -r '.[0].status')"
+exec_started="$(echo "$chk" | jq -r '.[0].started_at')"
+conf_st="$(echo "$chk_c" | jq -r '.[0].status')"
+conf_created="$(echo "$chk_c" | jq -r '.[0].created_at')"
+
+ok "injected: exec.status=$exec_st exec.started_at=$exec_started conf.status=$conf_st conf.created_at=$conf_created"
+
+# ---------------------------
+# 2) Wait scheduler to auto-cancel stale pending => SKIPPED
+# ---------------------------
+
+echo
+echo "==> [2] Waiting scheduler to auto-cancel stale pending => SKIPPED..."
+
+deadline=$((SECONDS + WAIT_SCHEDULER_SECONDS))
+done_flag="false"
+
+while (( SECONDS < deadline )); do
+  ex="$(sqlite_query_json "SELECT status,completed_at FROM runbook_executions WHERE id='${inject_exec_id}' LIMIT 1;" 2>/dev/null || echo '[]')"
+  if [[ "$(echo "$ex" | jq 'length')" -ge 1 ]]; then
+    st="$(echo "$ex" | jq -r '.[0].status // ""' | tr '[:upper:]' '[:lower:]')"
+    if [[ "$st" == "skipped" ]]; then
+      done_flag="true"
+      break
+    fi
+  fi
+  sleep_ms "$POLL_INTERVAL_MS"
+done
+
+if [[ "$done_flag" != "true" ]]; then
+  dump_exec_by_id "$inject_exec_id"
+  dump_confirm_by_pending "$inject_exec_id"
+  die "FAIL: scheduler did not auto-cancel stale pending within ${WAIT_SCHEDULER_SECONDS}s."
+fi
+
+final_ex="$(sqlite_query_json "SELECT status,completed_at FROM runbook_executions WHERE id='${inject_exec_id}' LIMIT 1;")"
+final_exec_st="$(echo "$final_ex" | jq -r '.[0].status // empty')"
+final_completed="$(echo "$final_ex" | jq -r '.[0].completed_at // empty')"
+ok "final exec: status=$final_exec_st completed_at=$final_completed"
+
+conf_any="$(sqlite_query_json "SELECT status,updated_at FROM runbook_confirmations WHERE pending_execution_id='${inject_exec_id}' LIMIT 1;")"
+[[ "$(echo "$conf_any" | jq 'length')" -eq 1 ]] || die "FAIL: missing runbook_confirmations row at end"
+
+final_conf_st="$(echo "$conf_any" | jq -r '.[0].status // empty')"
+final_conf_updated="$(echo "$conf_any" | jq -r '.[0].updated_at // empty')"
+ok "final confirmation: status=$final_conf_st updated_at=$final_conf_updated"
+
+[[ "$(echo "$final_conf_st" | tr '[:upper:]' '[:lower:]')" == "skipped" ]] || die "FAIL: confirmation not marked skipped"
+
+echo
+echo "STALE PENDING TTL SCHEDULER TEST v8 PASSED ✅"
