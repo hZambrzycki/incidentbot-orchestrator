@@ -1,0 +1,339 @@
+# Prometheus Alert Rules
+# These alerts will be sent to Alertmanager and then to Incident Bot
+
+groups:
+  # ============================================================
+  # Incident Bot - Health
+  # ============================================================
+  - name: incident-bot-health
+    rules:
+      - alert: IncidentBotDown
+        expr: up{job="incident-bot"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Incident Bot is down!"
+          description: "Incident Bot (job=incident-bot) is not responding."
+
+      - alert: IncidentBotSystemDegraded
+        expr: incident_bot_system_status < 1
+        for: 5m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Incident Bot reports degraded status"
+          description: "incident_bot_system_status is {{ $value }} for >5m."
+
+      - alert: TooManyActiveIncidents
+        expr: sum(incident_bot_incidents_active) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Too many active incidents"
+          description: "There are {{ $value }} active incidents (possible incident storm)."
+
+  # ============================================================
+  # Runbooks - Queue / Pending / Stuck / Failures
+  #  incident_bot_runbooks_pending, _running,
+  #  _pending_oldest_seconds, _pending_stale_total{threshold},
+  #  incident_bot_runbooks_executed_total, incident_bot_runbooks_failed_total)
+  # ============================================================
+  - name: incident-bot-runbooks
+    rules:
+      - alert: IncidentBotRunbookBacklogHigh
+        expr: incident_bot_runbooks_pending > 20
+        for: 10m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Runbook backlog high (pending > 20)"
+          description: "Pending runbooks = {{ $value }} for >10m."
+
+      - alert: IncidentBotRunbookPendingTooOld
+        expr: incident_bot_runbooks_pending_oldest_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Oldest pending runbook > 1h"
+          description: "Oldest pending age is {{ $value }}s (>3600s) for >10m."
+
+      - alert: IncidentBotRunbookPendingTooOldCritical
+        expr: incident_bot_runbooks_pending_oldest_seconds > 21600
+        for: 10m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Oldest pending runbook > 6h"
+          description: "Oldest pending age is {{ $value }}s (>21600s) for >10m."
+
+      # Backlog por volumen: cuántos PENDING llevan >= 6h (threshold="21600")
+      - alert: IncidentBotPendingStaleVolume
+        expr: incident_bot_runbooks_pending_stale_total{threshold="21600"} > 10
+        for: 10m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Too many stale pending runbooks (>=6h)"
+          description: "More than 10 pending runbooks are older than 6h."
+
+      - alert: IncidentBotPendingStaleVolumeCritical
+        expr: incident_bot_runbooks_pending_stale_total{threshold="21600"} > 50
+        for: 5m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Critical stale pending backlog (>=6h)"
+          description: "More than 50 pending runbooks are older than 6h."
+
+      # Queue stuck: hay pending pero no se ejecuta nada
+      # Usamos increase para evitar falsos positivos cuando hay poco tráfico.
+      - alert: IncidentBotRunbookQueueStuck
+        expr: (incident_bot_runbooks_pending > 0) and (increase(incident_bot_runbooks_executed_total[15m]) == 0)
+        for: 15m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Runbook queue appears stuck"
+          description: "Pending > 0 but no runbooks executed in the last 15m."
+
+      - alert: IncidentBotRunbookFailuresSpike
+        expr: sum(increase(incident_bot_runbooks_failed_total[15m])) > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Runbook failures spike (final failures > 3 / 15m)"
+          description: "More than 3 final runbook failures in the last 15 minutes."
+
+      - alert: IncidentBotRunbookFailuresSpikeCritical
+        expr: sum(increase(incident_bot_runbooks_failed_total[15m])) > 10
+        for: 5m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Runbook failures spike CRITICAL (final failures > 10 / 15m)"
+          description: "More than 10 final runbook failures in the last 15 minutes."
+
+  # ============================================================
+  # Runbook Confirmation Latency
+  # incident_bot_runbook_confirmation_latency_seconds_bucket)
+  # ============================================================
+  - name: incident-bot-confirmations
+    rules:
+      - alert: IncidentBotRunbookConfirmationLatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(incident_bot_runbook_confirmation_latency_seconds_bucket[15m])) by (le)) > 600
+        for: 10m
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Runbook confirmation latency high (p95 > 10m)"
+          description: "p95 confirmation latency > 600s for 10m."
+
+      - alert: IncidentBotRunbookConfirmationLatencyVeryHigh
+        expr: histogram_quantile(0.95, sum(rate(incident_bot_runbook_confirmation_latency_seconds_bucket[15m])) by (le)) > 1800
+        for: 10m
+        labels:
+          severity: critical
+          service: incident-bot
+        annotations:
+          summary: "Runbook confirmation latency very high (p95 > 30m)"
+          description: "p95 confirmation latency > 1800s for 10m."
+
+  # ============================================================
+  # Host / Node alerts (node_exporter)
+  # ============================================================
+  - name: system_alerts
+    rules:
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{job="node",mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: 'CPU usage > 80% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: health_check
+
+      - alert: CriticalCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{job="node",mode="idle"}[5m])) * 100) > 95
+        for: 2m
+        labels:
+          severity: critical
+          service: system
+        annotations:
+          summary: "Critical CPU usage on {{ $labels.instance }}"
+          description: 'CPU usage > 95% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: restart_service
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes{job="node"} / node_memory_MemTotal_bytes{job="node"})) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: 'Memory usage > 85% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: health_check
+
+      - alert: CriticalMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes{job="node"} / node_memory_MemTotal_bytes{job="node"})) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          service: system
+        annotations:
+          summary: "Critical memory usage on {{ $labels.instance }}"
+          description: 'Memory usage > 95% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: restart_service
+
+      - alert: DiskSpaceLow
+        expr: |
+          max by(instance, mountpoint) (
+            (1 -
+              (node_filesystem_avail_bytes{job="node",fstype!="tmpfs",mountpoint!~"^/(run/desktop|mnt/host|usr/lib/wsl|parent-distro).*"}
+              /
+               node_filesystem_size_bytes{job="node",fstype!="tmpfs",mountpoint!~"^/(run/desktop|mnt/host|usr/lib/wsl|parent-distro).*"})
+            ) * 100
+          ) > 80
+        for: 5m
+        labels:
+          service: disk
+          severity: warning
+        annotations:
+          summary: "Disk space low on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+          description: 'Disk usage > 80% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: cleanup_disk
+
+      - alert: DiskSpaceCritical
+        expr: |
+          max by(instance, mountpoint) (
+            (1 -
+              (node_filesystem_avail_bytes{job="node",fstype!="tmpfs",mountpoint!~"^/(run/desktop|mnt/host|usr/lib/wsl|parent-distro).*"}
+              /
+               node_filesystem_size_bytes{job="node",fstype!="tmpfs",mountpoint!~"^/(run/desktop|mnt/host|usr/lib/wsl|parent-distro).*"})
+            ) * 100
+          ) > 90
+        for: 2m
+        labels:
+          severity: critical
+          service: disk
+        annotations:
+          summary: "Disk space critical on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+          description: 'Disk usage > 90% (current: {{ $value | printf "%.1f" }}%)'
+          runbook: cleanup_disk
+
+      - alert: HighLoadAverage
+        expr: node_load15{job="node"} / count without (cpu, mode) (node_cpu_seconds_total{job="node",mode="idle"}) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High load average on {{ $labels.instance }}"
+          description: '15m load average is high (current: {{ $value | printf "%.2f" }})'
+          runbook: health_check
+
+  # ============================================================
+  # Service / scrape availability
+  # ============================================================
+  - name: service_alerts
+    rules:
+      - alert: ServiceDown
+        expr: up{job=~"incident-bot|prometheus|cadvisor|node|alertmanager"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} on {{ $labels.instance }} is not responding"
+          runbook: restart_service
+
+  # ============================================================
+  # cAdvisor / Containers
+  # ============================================================
+  - name: container_alerts
+    rules:
+      - alert: ContainerHighCPU
+        expr: |
+          topk(1, sum by (id) (rate(container_cpu_usage_seconds_total{job="cadvisor",cpu="total",id=~"^/docker/[0-9a-f]{64}$"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Some container has high CPU usage"
+          description: "A container is above 80% CPU (top offender value: {{ $value }})."
+          runbook: health_check
+
+      - alert: ContainerHighMemory
+        expr: |
+          (
+            container_memory_working_set_bytes{job="cadvisor",id=~"^/docker/[0-9a-f]{64}$"}
+            /
+            container_spec_memory_limit_bytes{job="cadvisor",id=~"^/docker/[0-9a-f]{64}$"}
+          ) * 100 > 80
+          and on(id)
+          container_spec_memory_limit_bytes{job="cadvisor",id=~"^/docker/[0-9a-f]{64}$"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container high memory usage"
+          description: "A container is above 80% of memory limit."
+          runbook: health_check
+
+  # ============================================================
+  # Synthetic tests (tu fault injector)
+  # ============================================================
+  - name: test_alerts
+    rules:
+      - alert: SyntheticDiskSpaceLow
+        expr: incident_bot_fault{type="synthetic_disk"} == 1
+        for: 10s
+        labels:
+          severity: critical
+          service: disk
+        annotations:
+          summary: "Synthetic DiskSpaceLow (test)"
+          description: "Synthetic alert to validate full pipeline"
+          error_type: "disk_space_low"
+          runbook: cleanup_disk
+
+      - alert: SyntheticHighCPU
+        expr: incident_bot_fault{type="synthetic_cpu"} == 1
+        for: 10s
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "Synthetic HighCPU (test)"
+          description: "Synthetic alert to validate full pipeline"
+          error_type: "high_cpu"
+          runbook: health_check
+
+      - alert: SyntheticContainerIssue
+        expr: incident_bot_fault{type="synthetic_container"} == 1
+        for: 10s
+        labels:
+          severity: warning
+          service: incident-bot
+        annotations:
+          summary: "Synthetic Container Issue (test)"
+          description: "Synthetic alert to test docker logs path"
+          runbook: health_check

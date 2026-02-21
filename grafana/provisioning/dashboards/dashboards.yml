@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: "Incident Bot"
+    orgId: 1
+    folder: "Incident Bot"
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

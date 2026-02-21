@@ -1,0 +1,28 @@
+# virtual environment
+venv/
+.env/
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# distribution
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# env variables
+.env
+
+# logs
+*.log
+
+# macOS
+.DS_Store

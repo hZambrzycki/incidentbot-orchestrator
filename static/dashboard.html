@@ -1,0 +1,708 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>IncidentBot Dashboard</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .row2 { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px; text-align: left; vertical-align: top; }
+    th { background: #fafafa; position: sticky; top: 0; z-index: 1; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .ok { border-color:#b9e2c6; background:#eef9f1; }
+    .warn { border-color:#ffe1a6; background:#fff7e6; }
+    .bad { border-color:#ffb3b3; background:#fff0f0; }
+    .muted { color:#666; }
+    .btn { cursor:pointer; border:1px solid #ddd; background:#fff; padding:8px 10px; border-radius:8px; }
+    .btn:hover { background:#fafafa; }
+    .input { width: 100%; padding: 10px; border:1px solid #ddd; border-radius:8px; }
+    .grid2 { display:grid; grid-template-columns: 1fr auto; gap: 10px; align-items:center; }
+    .toolbar { display:grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 8px; align-items:center; }
+    .small { font-size: 12px; }
+    .right { text-align:right; }
+    .click { cursor: pointer; }
+    .click:hover { background:#fafafa; }
+    .hr { height:1px; background:#eee; margin: 10px 0; }
+
+    /* Login modal */
+    .modalBackdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.35);
+      display:flex; align-items:center; justify-content:center;
+      z-index: 100;
+    }
+    .modal {
+      width: min(520px, calc(100vw - 40px));
+      background:#fff; border-radius: 14px; padding: 14px; border:1px solid #ddd;
+      box-shadow: 0 10px 40px rgba(0,0,0,.15);
+    }
+
+    /* Forensics side panel */
+    .sideBackdrop {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.35);
+      display:none;
+      align-items:stretch;
+      justify-content:flex-end;
+      z-index: 90;
+    }
+    .sidePanel {
+      width: min(860px, calc(100vw - 40px));
+      background:#fff;
+      border-left: 1px solid #ddd;
+      padding: 14px;
+      overflow:auto;
+      box-shadow: -10px 0 40px rgba(0,0,0,.12);
+    }
+    .kv { display:grid; grid-template-columns: 190px 1fr; gap: 8px; }
+    .kv div { padding: 2px 0; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>IncidentBot Dashboard</h1>
+  <div class="muted mono">Auth: X-Admin-Token (guardado en localStorage) — auto-limpia comillas</div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card">
+      <div><strong>System</strong> <span id="sysPill" class="pill">…</span></div>
+      <div class="mono" id="sysMeta"></div>
+    </div>
+    <div class="card">
+      <div><strong>Incidents</strong></div>
+      <div class="mono" id="incMeta"></div>
+    </div>
+    <div class="card">
+      <div class="grid2">
+        <div><strong>Queue</strong></div>
+        <button class="btn" id="logoutBtn" title="Borra token">Logout</button>
+      </div>
+      <div class="mono" id="qMeta"></div>
+    </div>
+  </div>
+
+  <div class="row2" style="margin-top:12px;">
+    <div class="card">
+      <div class="grid2">
+        <div><strong>Top failures by hash</strong> <span class="muted small">(hash / count / last_seen)</span></div>
+        <button class="btn" id="refreshBtn" title="Refresca ahora">Refresh</button>
+      </div>
+      <table id="failTopTable">
+        <thead><tr><th>Hash</th><th class="right">Count</th><th>Last seen</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted mono small" id="failTopMeta"></div>
+    </div>
+
+    <div class="card">
+      <div class="grid2">
+        <div><strong>Recent events</strong> <span class="muted small">(created_at / type / sev / message)</span></div>
+        <div class="muted mono small" id="eventsMeta"></div>
+      </div>
+      <table id="recentEventsTable">
+        <thead><tr><th>Created</th><th>Type</th><th>Sev</th><th>Message</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted mono small">Click event → forensics (si tiene execution_id).</div>
+    </div>
+  </div>
+
+  <h2>Executions</h2>
+  <div class="card">
+    <div class="toolbar" style="margin-bottom:10px;">
+      <input id="fIncident" class="input mono" placeholder="incident_id (opcional)"/>
+      <input id="fRunbook" class="input mono" placeholder="runbook_name (opcional)"/>
+      <input id="fService" class="input mono" placeholder="target_service (opcional)"/>
+      <input id="fStatus" class="input mono" placeholder="status (pending|running|success|failed|timeout|skipped...)"/>
+      <button class="btn" id="applyFiltersBtn">Apply</button>
+    </div>
+    <div class="muted mono small" id="execMeta"></div>
+    <div style="height:8px;"></div>
+
+    <table id="execTable">
+      <thead>
+        <tr>
+          <th>Started</th>
+          <th>Status</th>
+          <th>Runbook</th>
+          <th>Service</th>
+          <th>Triggered</th>
+          <th>Incident</th>
+          <th>Exec ID</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div class="muted mono small" style="margin-top:8px;">
+      Click row → forensics (CSI: SQLite Edition).
+    </div>
+  </div>
+
+  <h2>Active Incidents</h2>
+  <div class="card">
+    <table id="incTable">
+      <thead><tr><th>Severity</th><th>Title</th><th>Service</th><th>Instance</th><th>ID</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <h2>Pending Confirmations</h2>
+  <div class="card">
+    <table id="pendTable">
+      <thead><tr><th>Age(s)</th><th>Runbook</th><th>Service</th><th>Incident</th><th>Pending Exec</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <h2>Queue items</h2>
+  <div class="row2">
+    <div class="card">
+      <div class="grid2">
+        <div><strong>Control-plane queued/pending (runbook_queue)</strong></div>
+        <div class="muted mono small" id="queueItemsMeta"></div>
+      </div>
+      <table id="queueItemsTable">
+        <thead><tr><th>Age(s)</th><th>Status</th><th>Attempts</th><th>Runbook</th><th>Service</th><th>Exec</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div><strong>Control-plane running (runbook_queue)</strong></div>
+      <table id="queueRunningTable">
+        <thead><tr><th>Age(s)</th><th>Status</th><th>Lease</th><th>Runbook</th><th>Service</th><th>Exec</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row2" style="margin-top:12px;">
+    <div class="card">
+      <div><strong>Queue samples (oldest) — pending/runbook_executions</strong></div>
+      <table id="qPendTable">
+        <thead><tr><th>Age(s)</th><th>Runbook</th><th>Service</th><th>Exec</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div><strong>Queue samples (oldest) — running/runbook_executions</strong></div>
+      <table id="qRunTable">
+        <thead><tr><th>Age(s)</th><th>Runbook</th><th>Service</th><th>Exec</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Forensics side panel -->
+  <div id="sideBackdrop" class="sideBackdrop" aria-hidden="true">
+    <div class="sidePanel">
+      <div class="grid2">
+        <div>
+          <h2 style="margin:0;">Forensics</h2>
+          <div class="muted mono small" id="fxSub">…</div>
+        </div>
+        <button class="btn" id="closeSideBtn">Close</button>
+      </div>
+
+      <div class="hr"></div>
+
+      <div><strong>Execution</strong></div>
+      <div class="kv mono small" id="fxExecKv"></div>
+
+      <div class="hr"></div>
+
+      <div class="row2">
+        <div>
+          <div><strong>Failures (runbook_failures)</strong></div>
+          <table id="fxFailuresTable">
+            <thead><tr><th>At</th><th>Kind</th><th>Final</th><th>Status</th><th>Hash</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <div><strong>Queue item (runbook_queue)</strong></div>
+          <div class="kv mono small" id="fxQueueKv"></div>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div><strong>Events (incident_events)</strong></div>
+      <table id="fxEventsTable">
+        <thead><tr><th>At</th><th>Type</th><th>Sev</th><th>Message</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <div class="hr"></div>
+      <div><strong>Payload</strong> <span class="muted small">(output / error / parameters)</span></div>
+      <pre class="mono small" id="fxPayload"></pre>
+    </div>
+  </div>
+
+  <!-- Login modal -->
+  <div id="loginBackdrop" class="modalBackdrop" style="display:none;">
+    <div class="modal">
+      <h2 style="margin:0 0 10px 0;">Admin token</h2>
+      <div class="muted">Introduce tu token. Se enviará como <span class="mono">X-Admin-Token</span>.</div>
+      <div style="height:10px;"></div>
+      <input id="tokenInput" class="input mono" placeholder="X-Admin-Token…" autocomplete="off"/>
+      <div style="height:10px;"></div>
+      <div class="grid2">
+        <div class="muted mono" id="loginMsg"></div>
+        <button class="btn" id="loginBtn">Save</button>
+      </div>
+      <div class="muted mono small" style="margin-top:10px;">
+        Tip: si pegas <span class="mono">"skyzo"</span> lo limpio a <span class="mono">skyzo</span>.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const LS_KEY = "INCIDENTBOT_ADMIN_TOKEN";
+
+    function normalizeToken(t){
+      t = (t || "").trim();
+      // quita comillas si vienen pegadas (iOS/Safari suele colarlas)
+      if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+        t = t.slice(1, -1).trim();
+      }
+      // por si alguien pega varias comillas
+      t = t.replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "").trim();
+      return t;
+    }
+
+    function getToken(){ return normalizeToken(localStorage.getItem(LS_KEY) || ""); }
+    function setToken(t){ localStorage.setItem(LS_KEY, normalizeToken(t)); }
+    function clearToken(){ localStorage.removeItem(LS_KEY); }
+
+    function showLogin(msg){
+      document.getElementById("loginMsg").textContent = msg || "";
+      document.getElementById("loginBackdrop").style.display = "flex";
+      setTimeout(()=>document.getElementById("tokenInput").focus(), 50);
+    }
+    function hideLogin(){ document.getElementById("loginBackdrop").style.display = "none"; }
+
+    function esc(s){
+      return String(s ?? "")
+        .replaceAll("&","&amp;")
+        .replaceAll("<","&lt;")
+        .replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;")
+        .replaceAll("'","&#039;");
+    }
+
+    function pillClass(status){
+      if(status === "healthy") return "pill ok";
+      if(status === "degraded") return "pill warn";
+      if(status === "critical") return "pill bad";
+      return "pill bad";
+    }
+
+    function sevPill(sev){
+      const s = (sev||"").toLowerCase();
+      if(s === "error" || s === "critical") return "pill bad";
+      if(s === "warning") return "pill warn";
+      return "pill ok";
+    }
+
+    function stPill(st){
+      const s = (st||"").toLowerCase();
+      if(s === "success") return "pill ok";
+      if(s === "skipped") return "pill warn";
+      if(s === "queued" || s === "pending" || s === "running") return "pill warn";
+      return "pill bad";
+    }
+
+    async function authedFetch(url){
+      const token = getToken();
+      const headers = token ? { "X-Admin-Token": token } : {};
+      const res = await fetch(url, { headers });
+
+      if(res.status === 401){
+        // self-heal: por si en localStorage se quedó con comillas antiguas
+        const repaired = normalizeToken(localStorage.getItem(LS_KEY) || "");
+        if(repaired && repaired !== (localStorage.getItem(LS_KEY) || "")){
+          localStorage.setItem(LS_KEY, repaired);
+        }
+        showLogin("Unauthorized (401). Revisa el token (sin comillas).");
+        throw new Error("401");
+      }
+      if(res.status === 503){
+        showLogin("Admin token no configurado (503). Revisa settings.");
+        throw new Error("503");
+      }
+      return res;
+    }
+
+    function getExecFilters(){
+      return {
+        incident_id: document.getElementById("fIncident").value.trim(),
+        runbook_name: document.getElementById("fRunbook").value.trim(),
+        target_service: document.getElementById("fService").value.trim(),
+        status: document.getElementById("fStatus").value.trim(),
+      };
+    }
+
+    function buildQS(obj){
+      const qs = new URLSearchParams();
+      for(const [k,v] of Object.entries(obj)){
+        if(v) qs.set(k, v);
+      }
+      return qs.toString();
+    }
+
+    function openSide(){ document.getElementById("sideBackdrop").style.display = "flex"; }
+    function closeSide(){ document.getElementById("sideBackdrop").style.display = "none"; }
+
+    async function openForensics(executionId){
+      if(!executionId) return;
+      const res = await authedFetch("/api/dashboard/executions/" + encodeURIComponent(executionId));
+      if(!res.ok){
+        alert("Failed to load forensics: HTTP " + res.status);
+        return;
+      }
+      const data = await res.json();
+
+      const ex = data.execution || {};
+      const q = data.queue_item || null;
+      const failures = data.failures || [];
+      const events = data.events || [];
+
+      document.getElementById("fxSub").textContent =
+        `${esc(ex.runbook_name || "")} • ${esc(ex.status || "")} • ${esc(executionId)}`;
+
+      const kv = [];
+      const push = (k,v)=> kv.push(`<div class="muted">${esc(k)}</div><div class="mono">${esc(v ?? "")}</div>`);
+      push("id", ex.id || executionId);
+      push("incident_id", ex.incident_id);
+      push("runbook_name", ex.runbook_name);
+      push("status", ex.status);
+      push("triggered_by", ex.triggered_by);
+      push("target_service", ex.target_service);
+      push("target_instance", ex.target_instance);
+      push("started_at", ex.started_at);
+      push("completed_at", ex.completed_at);
+      push("duration_seconds", ex.duration_seconds);
+      push("execution_origin", ex.execution_origin);
+      push("retry_of_execution_id", ex.retry_of_execution_id);
+      document.getElementById("fxExecKv").innerHTML = kv.join("");
+
+      const qkv = [];
+      const qpush = (k,v)=> qkv.push(`<div class="muted">${esc(k)}</div><div class="mono">${esc(v ?? "")}</div>`);
+      if(q){
+        qpush("status", q.status);
+        qpush("attempts", q.attempts);
+        qpush("available_at", q.available_at);
+        qpush("lease_owner", q.lease_owner);
+        qpush("lease_expires_at", q.lease_expires_at);
+        qpush("last_heartbeat", q.last_heartbeat);
+        qpush("updated_at", q.updated_at);
+      } else {
+        qpush("queue_item", "—");
+      }
+      document.getElementById("fxQueueKv").innerHTML = qkv.join("");
+
+      const fb = document.querySelector("#fxFailuresTable tbody");
+      fb.innerHTML = "";
+      failures.forEach(f => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="mono">${esc(f.created_at || "")}</td>
+          <td class="mono">${esc(f.failure_kind || "")}</td>
+          <td class="mono">${esc(f.is_final ?? "")}</td>
+          <td class="mono">${esc(f.final_status || "")}</td>
+          <td class="mono">${esc(f.error_hash || "")}</td>
+        `;
+        fb.appendChild(tr);
+      });
+
+      const eb = document.querySelector("#fxEventsTable tbody");
+      eb.innerHTML = "";
+      events.forEach(e => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="mono">${esc(e.created_at || "")}</td>
+          <td class="mono">${esc(e.event_type || "")}</td>
+          <td><span class="${sevPill(e.severity)}">${esc(e.severity || "")}</span></td>
+          <td>${esc(e.message || "")}</td>
+        `;
+        eb.appendChild(tr);
+      });
+
+      const payload = { parameters: ex.parameters || null, output: ex.output || null, error: ex.error || null };
+      document.getElementById("fxPayload").textContent = JSON.stringify(payload, null, 2);
+
+      openSide();
+    }
+
+    async function loadSummaryAndPanels(){
+      const res = await authedFetch("/api/dashboard/summary?limit_samples=10");
+      if(!res.ok){
+        document.getElementById("sysPill").textContent = "ERROR";
+        document.getElementById("sysPill").className = "pill bad";
+        document.getElementById("sysMeta").textContent = `HTTP ${res.status}`;
+        return null;
+      }
+      const data = await res.json();
+
+      // system
+      const sys = data.system || {};
+      const sysPill = document.getElementById("sysPill");
+      sysPill.textContent = sys.status || "unknown";
+      sysPill.className = pillClass(sys.status);
+      document.getElementById("sysMeta").textContent =
+        `app=${sys.app_name} env=${sys.env} active_incidents=${sys.active_incidents}`;
+
+      // incidents meta + table
+      const inc = data.incidents || {};
+      document.getElementById("incMeta").textContent =
+        `active=${inc.active_total} by_sev=${JSON.stringify(inc.by_severity || {})}`;
+
+      const incTbody = document.querySelector("#incTable tbody");
+      incTbody.innerHTML = "";
+      (inc.items || []).forEach(i => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td><span class="pill">${esc(i.severity)}</span></td>
+          <td>${esc(i.title || "")}</td>
+          <td class="mono">${esc(i.service || "")}</td>
+          <td class="mono">${esc(i.instance || "")}</td>
+          <td class="mono">${esc(i.id)}</td>
+        `;
+        incTbody.appendChild(tr);
+      });
+
+      // queue meta + samples (runbook_executions)
+      const q = data.queue || {};
+      document.getElementById("qMeta").textContent =
+        `pending=${q.totals?.pending ?? 0} running=${q.totals?.running ?? 0} ` +
+        `oldest_pending_s=${Math.round(q.oldest_seconds?.pending ?? 0)} ` +
+        `oldest_running_s=${Math.round(q.oldest_seconds?.running ?? 0)}`;
+
+      const qp = (q.samples?.pending || []);
+      const qr = (q.samples?.running || []);
+      const qPendBody = document.querySelector("#qPendTable tbody");
+      const qRunBody = document.querySelector("#qRunTable tbody");
+      qPendBody.innerHTML = "";
+      qRunBody.innerHTML = "";
+
+      qp.forEach(x => {
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(x.execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(x.age_seconds ?? "")}</td>
+          <td class="mono">${esc(x.runbook || "")}</td>
+          <td class="mono">${esc(x.target_service || "")}</td>
+          <td class="mono">${esc(x.execution_id || "")}</td>
+        `;
+        qPendBody.appendChild(tr);
+      });
+
+      qr.forEach(x => {
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(x.execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(x.age_seconds ?? "")}</td>
+          <td class="mono">${esc(x.runbook || "")}</td>
+          <td class="mono">${esc(x.target_service || "")}</td>
+          <td class="mono">${esc(x.execution_id || "")}</td>
+        `;
+        qRunBody.appendChild(tr);
+      });
+
+      // pending confirmations (list_pending_runbooks response)
+      const pend = (data.pending_confirmations?.pending || []);
+      const pendTbody = document.querySelector("#pendTable tbody");
+      pendTbody.innerHTML = "";
+      pend.forEach(p => {
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(p.pending_execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(p.age_seconds)}</td>
+          <td class="mono">${esc(p.runbook_name)}</td>
+          <td class="mono">${esc(p.target_service || "")}</td>
+          <td class="mono">${esc(p.incident?.id || "")}</td>
+          <td class="mono">${esc(p.pending_execution_id)}</td>
+        `;
+        pendTbody.appendChild(tr);
+      });
+
+      // top failures by hash (failures_top.top_error_hash)
+      const top = data.failures_top || {};
+      const rows = top.top_error_hash || [];
+      const ftBody = document.querySelector("#failTopTable tbody");
+      ftBody.innerHTML = "";
+      rows.forEach(x => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="mono">${esc(x.k)}</td>
+          <td class="mono right">${esc(x.n)}</td>
+          <td class="mono">${esc(x.last_seen || "")}</td>
+        `;
+        ftBody.appendChild(tr);
+      });
+      document.getElementById("failTopMeta").textContent =
+        `window_hours=${esc(top.window_hours ?? "")} since=${esc(top.since ?? "")}`;
+
+      // recent events now come from summary: data.events.recent
+      const recent = (data.events?.recent || []);
+      document.getElementById("eventsMeta").textContent = `total=${recent.length}`;
+
+      const evBody = document.querySelector("#recentEventsTable tbody");
+      evBody.innerHTML = "";
+      recent.forEach(e => {
+        const tr = document.createElement("tr");
+        tr.className = e.execution_id ? "click" : "";
+        tr.title = e.execution_id ? "Open forensics" : "";
+        if(e.execution_id) tr.onclick = ()=> openForensics(e.execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(e.created_at || "")}</td>
+          <td class="mono">${esc(e.event_type || "")}</td>
+          <td><span class="${sevPill(e.severity)}">${esc(e.severity || "")}</span></td>
+          <td>${esc(e.message || "")}</td>
+        `;
+        evBody.appendChild(tr);
+      });
+
+      return data;
+    }
+
+    async function loadExecutions(){
+      const filters = getExecFilters();
+      const qs = buildQS({ ...filters, limit: "60" });
+      const url = "/api/dashboard/executions" + (qs ? ("?" + qs) : "");
+
+      const res = await authedFetch(url);
+      if(!res.ok){
+        document.getElementById("execMeta").textContent = `HTTP ${res.status}`;
+        return;
+      }
+      const data = await res.json();
+      const items = data.items || [];
+      document.getElementById("execMeta").textContent =
+        `items=${items.length} filters=${JSON.stringify(filters)}`;
+
+      const body = document.querySelector("#execTable tbody");
+      body.innerHTML = "";
+      items.forEach(x => {
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(x.id);
+        tr.innerHTML = `
+          <td class="mono">${esc(x.started_at || "")}</td>
+          <td><span class="${stPill(x.status)}">${esc(x.status || "")}</span></td>
+          <td class="mono">${esc(x.runbook_name || "")}</td>
+          <td class="mono">${esc(x.target_service || "")}</td>
+          <td class="mono">${esc(x.triggered_by || "")}</td>
+          <td class="mono">${esc(x.incident_id || "")}</td>
+          <td class="mono">${esc(x.id || "")}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
+
+    async function loadQueueItems(){
+      const res = await authedFetch("/api/dashboard/queue/items?limit=60");
+      if(!res.ok){
+        document.getElementById("queueItemsMeta").textContent = `HTTP ${res.status}`;
+        return;
+      }
+      const data = await res.json();
+      document.getElementById("queueItemsMeta").textContent =
+        `queued=${data.totals?.queued ?? 0} running=${data.totals?.running ?? 0}`;
+
+      const pendBody = document.querySelector("#queueItemsTable tbody");
+      const runBody = document.querySelector("#queueRunningTable tbody");
+      pendBody.innerHTML = "";
+      runBody.innerHTML = "";
+
+      (data.items?.queued || []).forEach(x => {
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(x.execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(x.age_seconds ?? "")}</td>
+          <td><span class="${stPill(x.status)}">${esc(x.status || "")}</span></td>
+          <td class="mono">${esc(x.attempts ?? "")}</td>
+          <td class="mono">${esc(x.runbook_name || "")}</td>
+          <td class="mono">${esc(x.target_service || "")}</td>
+          <td class="mono">${esc(x.execution_id || "")}</td>
+        `;
+        pendBody.appendChild(tr);
+      });
+
+      (data.items?.running || []).forEach(x => {
+        const lease = x.lease_owner ? (x.lease_owner + " @" + (x.lease_expires_at || "")) : "";
+        const tr = document.createElement("tr");
+        tr.className = "click";
+        tr.title = "Open forensics";
+        tr.onclick = ()=> openForensics(x.execution_id);
+        tr.innerHTML = `
+          <td class="mono">${esc(x.age_seconds ?? "")}</td>
+          <td><span class="${stPill(x.status)}">${esc(x.status || "")}</span></td>
+          <td class="mono">${esc(lease)}</td>
+          <td class="mono">${esc(x.runbook_name || "")}</td>
+          <td class="mono">${esc(x.target_service || "")}</td>
+          <td class="mono">${esc(x.execution_id || "")}</td>
+        `;
+        runBody.appendChild(tr);
+      });
+    }
+
+    async function loadAll(){
+      await loadSummaryAndPanels();
+      await Promise.all([ loadExecutions(), loadQueueItems() ]);
+    }
+
+    // login wiring
+    document.getElementById("loginBtn").onclick = async () => {
+      const raw = document.getElementById("tokenInput").value;
+      const t = normalizeToken(raw);
+      if(!t){ document.getElementById("loginMsg").textContent = "Pon un token."; return; }
+      setToken(t);
+      hideLogin();
+      try { await loadAll(); } catch(e) {}
+    };
+
+    // Enter = login
+    document.getElementById("tokenInput").addEventListener("keydown", (e)=>{
+      if(e.key === "Enter") document.getElementById("loginBtn").click();
+    });
+
+    document.getElementById("logoutBtn").onclick = () => {
+      clearToken();
+      showLogin("Token borrado. Vuelve a autenticar.");
+    };
+
+    document.getElementById("refreshBtn").onclick = () => loadAll().catch(()=>{});
+    document.getElementById("applyFiltersBtn").onclick = () => loadExecutions().catch(()=>{});
+
+    // side panel wiring
+    document.getElementById("closeSideBtn").onclick = closeSide;
+    document.getElementById("sideBackdrop").addEventListener("click", (e)=>{
+      if(e.target && e.target.id === "sideBackdrop") closeSide();
+    });
+    window.addEventListener("keydown", (e)=>{ if(e.key === "Escape") closeSide(); });
+
+    // boot
+    if(!getToken()){
+      showLogin("Introduce el admin token para ver la dashboard.");
+    } else {
+      loadAll().catch(()=>{});
+    }
+    setInterval(()=>loadAll().catch(()=>{}), 5000);
+  </script>
+</body>
+</html>
