@@ -1119,5 +1119,6 @@ password: admin
 ---
 
 5. Stop the stack
-
+```
 docker compose down
+```
