@@ -10,7 +10,7 @@
 - [Observability](#observability)
 - [Summary](#summary)
 - [TESTS](#tests)
-
+- [QUICK START](#quick-start)
 ---
 
 # ***Overview***
@@ -1058,3 +1058,66 @@ PENDING_REMINDER_LOOP_INTERVAL_SECONDS=
 # TESTS
 
 in repo folder /tests
+
+
+# QUICK START
+
+## Quick Start
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/hZambrzycki/incidentbot-orchestrator.git
+cd incidentbot-orchestrator
+```
+
+---
+
+2. Start the full stack
+
+```
+docker compose up -d --build
+```
+This will start:
+
+- IncidentBot API
+
+- Prometheus (metrics collection)
+
+- Alertmanager (alert routing)
+
+- Grafana (dashboards)
+
+- Node Exporter (host metrics)
+
+- cAdvisor (container metrics)
+
+---
+
+3. Access the services
+
+| Service         | URL                                                                  |
+| --------------- | -------------------------------------------------------------------- |
+| IncidentBot API | [http://localhost:8000](http://localhost:8000)                       |
+| API Health      | [http://localhost:8000/api/health](http://localhost:8000/api/health) |
+| Grafana         | [http://localhost:3000](http://localhost:3000)                       |
+| Prometheus      | [http://localhost:9090](http://localhost:9090)                       |
+| Alertmanager    | [http://localhost:9093](http://localhost:9093)                       |
+| cAdvisor        | [http://localhost:8080](http://localhost:8080)                       |
+
+Grafana credentials:
+user: admin
+password: admin
+
+---
+
+4. Verify system health
+```
+  curl http://localhost:8000/api/health
+```
+{"status":"ok"}
+---
+
+5. Stop the stack
+
+docker compose down
