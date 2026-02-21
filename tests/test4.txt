@@ -1,0 +1,257 @@
+SRE Recovery Test - Queue reconciler validation 
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================
+# SRE Recovery Test - Queue reconciler validation (paste-safe)
+# Validates:
+# - pending linkage survives restart (confirmed_* fields persist)
+# - after restart, reconciler drives confirmed execution to a terminal state
+# - key gauges exist (pending/running + oldest seconds)
+# =========================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+# Health endpoint (en tu PS script es /api/health)
+HEALTH_URL="${HEALTH_URL:-$BASE_URL/api/health}"
+METRICS_URL="${METRICS_URL:-$BASE_URL/metrics}"
+
+RUNBOOK="${RUNBOOK:-restart_service}"
+TARGET_SERVICE="${TARGET_SERVICE:-frontend}"
+
+STALE_RUNNING_SECONDS="${STALE_RUNNING_SECONDS:-30}"
+EXTRA_SLACK_SECONDS="${EXTRA_SLACK_SECONDS:-6}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+warn() { echo "⚠️  $*" >&2; }
+
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+assert_equals() { [[ "$1" == "$2" ]] || die "$3 (expected=$2 got=$1)"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-30}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable: $url"
+}
+
+# wait_until <seconds> <command...>
+# command must return 0 when predicate is true
+wait_until() {
+  local seconds="$1"; shift
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if "$@"; then
+      return 0
+    fi
+    sleep 0.75
+  done
+  return 1
+}
+
+get_status() {
+  local exec_id="$1"
+  curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$exec_id" | jq -r '.status // empty'
+}
+
+get_history_json() {
+  local exec_id="$1"
+  curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$exec_id"
+}
+
+echo
+echo "==> Waiting API..."
+wait_http "$HEALTH_URL" 30
+
+# ---------------------------------------------------------
+# 1) Create incident via Alertmanager webhook
+# ---------------------------------------------------------
+fp="fp-sre-queue-$(openssl rand -hex 4 2>/dev/null || uuidgen | tr -d '-' | head -c8)"
+now="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+
+webhook_payload="$(jq -n \
+  --arg fp "$fp" \
+  --arg now "$now" \
+  --arg svc "$TARGET_SERVICE" \
+  '{
+    status:"firing",
+    receiver:"test",
+    groupKey:"test",
+    groupLabels:{alertname:"HighCPU", service:$svc},
+    commonLabels:{alertname:"HighCPU", service:$svc},
+    commonAnnotations:{summary:"SRE queue recovery test"},
+    externalURL:"http://localhost",
+    version:"4",
+    alerts:[{
+      status:"firing",
+      labels:{alertname:"HighCPU", service:$svc},
+      annotations:{summary:"SRE queue recovery test"},
+      startsAt:$now,
+      fingerprint:$fp
+    }]
+  }')"
+
+res="$(curl -fsS -X POST \
+  -H "Content-Type: application/json" \
+  -d "$webhook_payload" \
+  "$BASE_URL/webhook/alertmanager")"
+
+incident_id="$(echo "$res" | jq -r '.data.incidents[0].id // empty')"
+assert_nonempty "$incident_id" "Incident creation failed"
+echo "OK incident=$incident_id"
+
+# ---------------------------------------------------------
+# 2) Create pending execution
+# ---------------------------------------------------------
+pending_body="$(jq -n --arg iid "$incident_id" --arg svc "$TARGET_SERVICE" '{incident_id:$iid, target_service:$svc}')"
+
+pending_resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$pending_body" \
+  "$BASE_URL/api/runbooks/$RUNBOOK")"
+
+pending_id="$(echo "$pending_resp" | jq -r '.execution_id // empty')"
+assert_nonempty "$pending_id" "Pending creation failed"
+echo "OK pending=$pending_id"
+
+# ---------------------------------------------------------
+# 3) Confirm -> creates confirmed execution
+# ---------------------------------------------------------
+confirm_body='{"parameters":{}}'
+confirm_resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$confirm_body" \
+  "$BASE_URL/api/incidents/$incident_id/runbooks/$pending_id/confirm")"
+
+confirmed_id="$(echo "$confirm_resp" | jq -r '.confirmed_execution_id // empty')"
+assert_nonempty "$confirmed_id" "Confirm failed"
+echo "OK confirmed execution=$confirmed_id"
+
+# ---------------------------------------------------------
+# 4) Best-effort: observe RUNNING
+# ---------------------------------------------------------
+echo
+echo "==> Waiting confirmed execution to enter RUNNING (best-effort)..."
+
+if wait_until 10 bash -c "
+  s=\$(curl -fsS -H '$AUTH_HEADER' '$BASE_URL/api/runbooks/history/$confirmed_id' | jq -r '.status // empty')
+  [[ \"\$s\" == \"running\" ]]
+"; then
+  echo "OK confirmed execution is RUNNING"
+else
+  c0="$(get_history_json "$confirmed_id")"
+  s0="$(echo "$c0" | jq -r '.status // empty')"
+  warn "confirmed did not show RUNNING within 10s (status=$s0). Test still proceeds."
+fi
+
+# ---------------------------------------------------------
+# 5) Restart stack
+# ---------------------------------------------------------
+echo
+echo "==> Restarting stack..."
+docker compose restart >/dev/null
+sleep 4
+wait_http "$HEALTH_URL" 30
+
+# ---------------------------------------------------------
+# 6) Validate pending linkage survives restart
+# ---------------------------------------------------------
+p="$(get_history_json "$pending_id")"
+persist_confirmed_id="$(echo "$p" | jq -r '.confirmed_execution_id // empty')"
+confirmed_by="$(echo "$p" | jq -r '.confirmed_by // empty')"
+confirmed_at="$(echo "$p" | jq -r '.confirmed_at // empty')"
+
+assert_equals "$persist_confirmed_id" "$confirmed_id" "Pending lost confirmed_execution_id"
+assert_nonempty "$confirmed_by" "Pending lost confirmed_by"
+assert_nonempty "$confirmed_at" "Pending lost confirmed_at"
+echo "OK pending persistence verified"
+
+# ---------------------------------------------------------
+# 7) Wait for reconciler outcome (terminal state)
+# ---------------------------------------------------------
+echo
+echo "==> Waiting for reconciler outcome..."
+wait_seconds=$((STALE_RUNNING_SECONDS + EXTRA_SLACK_SECONDS))
+
+if ! wait_until "$wait_seconds" bash -c "
+  s=\$(curl -fsS -H '$AUTH_HEADER' '$BASE_URL/api/runbooks/history/$confirmed_id' | jq -r '.status // empty')
+  case \"\$s\" in failed|success|skipped|timeout) exit 0 ;; *) exit 1 ;; esac
+"; then
+  die "Execution did not reach a terminal state within ${wait_seconds} seconds"
+fi
+
+c="$(get_history_json "$confirmed_id")"
+status="$(echo "$c" | jq -r '.status // empty')"
+completed_at="$(echo "$c" | jq -r '.completed_at // empty')"
+assert_nonempty "$completed_at" "Execution missing completed_at"
+
+case "$status" in
+  failed)  echo "OK execution self-healed as FAILED (recovered)" ;;
+  success) echo "OK execution completed before/around restart" ;;
+  skipped) echo "OK execution ended as SKIPPED (policy outcome)" ;;
+  timeout) echo "OK execution ended as TIMEOUT (policy outcome)" ;;
+  *) die "Unexpected status: $status" ;;
+esac
+echo "OK terminal state verified status=$status"
+
+# ---------------------------------------------------------
+# 8) Metrics
+# ---------------------------------------------------------
+metrics="$(curl -fsS "$METRICS_URL")"
+
+echo "$metrics" | grep -q "incident_bot_runbooks_pending" \
+  || die "Metrics missing pending gauge"
+echo "$metrics" | grep -q "incident_bot_runbooks_running" \
+  || die "Metrics missing running gauge"
+echo "$metrics" | grep -q "incident_bot_runbooks_pending_oldest_seconds" \
+  || die "Metrics missing pending_oldest gauge"
+echo "$metrics" | grep -q "incident_bot_runbooks_running_oldest_seconds" \
+  || die "Metrics missing running_oldest gauge"
+
+echo "OK metrics verified"
+
+Qué hace este test
+
+Comprueba que la API responde (/api/health).
+
+Crea un incidente real vía webhook de Alertmanager y obtiene incidentId.
+
+Crea un runbook PENDING (restart_service) ligado a ese incidente.
+
+Confirma el pending y obtiene confirmed_execution_id.
+
+(Best-effort) intenta ver que el confirmed llega a RUNNING antes del restart.
+
+Reinicia todo el stack (docker compose restart) y espera de nuevo a que la API esté arriba.
+
+Verifica que el pending sigue linkeado al confirmed tras el restart:
+
+confirmed_execution_id, confirmed_by, confirmed_at siguen presentes en el history del pending.
+
+Espera a que el reconciler lleve el confirmed a un estado terminal tras el restart:
+
+failed | success | skipped | timeout
+
+y exige completed_at.
+
+Verifica que existen las métricas/gauges clave:
+
+incident_bot_runbooks_pending
+
+incident_bot_runbooks_running
+
+incident_bot_runbooks_pending_oldest_seconds
+
+incident_bot_runbooks_running_oldest_seconds
+echo "SRE QUEUE RECOVERY TEST PASSED ✅"
