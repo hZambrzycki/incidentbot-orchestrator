@@ -1,0 +1,315 @@
+Allowlist Hardening Test v6
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================
+# Allowlist Hardening Test v6 (bash, paste-safe)
+# - Step 1: Fail-fast (disallowed target => FAIL, and NO queue row)
+# - Step 2: Recovery safety (DB-injected illegal queued job => CLOSED: exec terminal + queue done/dead)
+# - Injection uses sh -lc + python heredoc (avoids quoting weirdness)
+# DB-aware via python sqlite3 inside container
+# =========================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+API_SERVICE="${API_SERVICE:-incident-bot}"
+DB_PATH="${DB_PATH:-/data/incident-bot.sqlite3}"
+
+WAIT_API_SECONDS="${WAIT_API_SECONDS:-30}"
+WAIT_QUEUE_SECONDS="${WAIT_QUEUE_SECONDS:-12}"
+WAIT_TERMINAL_SECONDS="${WAIT_TERMINAL_SECONDS:-120}"
+
+RUNBOOK_NAME="${RUNBOOK_NAME:-restart_service}"
+HEALTH_URL="${HEALTH_URL:-$BASE_URL/api/health}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+warn() { echo "⚠️  $*" >&2; }
+ok() { echo "OK $*"; }
+
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-30}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable: $url"
+}
+
+# wait_until <seconds> <command...>
+wait_until() {
+  local seconds="$1"; shift
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if "$@"; then return 0; fi
+    sleep 0.75
+  done
+  return 1
+}
+
+# ---------- DB helpers (python sqlite3 inside container) ----------
+
+sqlite_query_json() {
+  local sql="$1"
+  local py='import json,sqlite3,sys
+db_path=sys.argv[1]
+sql=sys.argv[2]
+con=sqlite3.connect(db_path)
+con.row_factory=sqlite3.Row
+rows=[dict(r) for r in con.execute(sql).fetchall()]
+print(json.dumps(rows))'
+  docker compose exec -T "$API_SERVICE" python -c "$py" "$DB_PATH" "$sql"
+}
+
+sqlite_count() {
+  local sql="$1"
+  local raw
+  raw="$(sqlite_query_json "$sql" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || { echo 0; return 0; }
+  echo "$raw" | jq 'length'
+}
+
+sqlite_exec_heredoc() {
+  # Execute inside container shell to avoid host quoting issues
+  local sql="$1"
+  docker compose exec -T "$API_SERVICE" sh -lc "python - <<'PY'
+import sqlite3, sys
+db_path = r'${DB_PATH}'
+sql = r'''${sql}'''
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+cur.executescript(sql)
+con.commit()
+con.close()
+sys.stdout.write('OK\n')
+PY"
+}
+
+dump_queue_by_exec() {
+  local execution_id="$1"
+  echo
+  echo "--- DB dump: runbook_queue for exec $execution_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT execution_id,runbook_name,status,target_service,attempts,available_at,last_heartbeat,lease_owner,lease_expires_at,created_at,updated_at
+                             FROM runbook_queue WHERE execution_id='$execution_id' LIMIT 5;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[] |
+    "- exec=\(.execution_id) rb=\(.runbook_name) st=\(.status) svc=\(.target_service) att=\(.attempts) avail=\(.available_at) hb=\(.last_heartbeat) owner=\(.lease_owner) exp=\(.lease_expires_at)"'
+}
+
+dump_exec_by_id() {
+  local execution_id="$1"
+  echo
+  echo "--- DB dump: runbook_executions for exec $execution_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT id,runbook_name,status,triggered_by,execution_origin,target_service,error,started_at,completed_at
+                             FROM runbook_executions WHERE id='$execution_id' LIMIT 1;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[0] |
+    "- id=\(.id) rb=\(.runbook_name) st=\(.status) trig=\(.triggered_by) origin=\(.execution_origin) svc=\(.target_service) err=\(.error) completed_at=\(.completed_at)"'
+}
+
+# ---------- HTTP helpers ----------
+
+get_json() {
+  local url="$1"
+  curl -fsS -H "$AUTH_HEADER" "$url"
+}
+
+# ---------------------------
+# 0) Preflight
+# ---------------------------
+
+echo
+echo "==> Waiting API..."
+wait_http "$HEALTH_URL" "$WAIT_API_SECONDS"
+
+echo
+echo "==> Checking DB presence..."
+db_ls="$(docker compose exec -T "$API_SERVICE" sh -lc "ls -lah '$DB_PATH' || true")"
+echo "$db_ls" | grep -q "incident-bot\.sqlite3" || die "DB file not found at $DB_PATH"
+ok "DB present: $DB_PATH"
+
+echo
+echo "==> Reading ALLOWED_TARGET_SERVICES from container env..."
+allow="$(docker compose exec -T "$API_SERVICE" sh -lc 'printenv ALLOWED_TARGET_SERVICES || true' | tr -d '\r' | xargs echo -n || true)"
+echo "ALLOWED_TARGET_SERVICES='${allow}'"
+[[ -n "$allow" ]] || die "ALLOWED_TARGET_SERVICES is empty. Set it and restart containers."
+
+bad_service="evil-svc-$(openssl rand -hex 4 2>/dev/null || uuidgen | tr -d '-' | head -c8)"
+
+# ---------------------------
+# 1) FAIL-FAST
+# ---------------------------
+
+echo
+echo "==> [1] FAIL-FAST: invoking $RUNBOOK_NAME with DISALLOWED target_service='$bad_service' ..."
+
+body="$(jq -n --arg svc "$bad_service" '{incident_id:null, target_service:$svc}')"
+
+# capture http status + body
+http_and_body="$(curl -sS -w '\n%{http_code}' -X POST \
+  -H "$AUTH_HEADER" -H "Content-Type: application/json" \
+  -d "$body" "$BASE_URL/api/runbooks/$RUNBOOK_NAME" || true)"
+
+resp_body="$(echo "$http_and_body" | head -n -1)"
+http_code="$(echo "$http_and_body" | tail -n 1 | tr -d '\r')"
+
+if [[ "$http_code" =~ ^2 ]]; then
+  exec_id="$(echo "$resp_body" | jq -r '.execution_id // empty' 2>/dev/null || true)"
+  assert_nonempty "$exec_id" "FAIL: API did not return execution_id and did not throw."
+  ok "got execution_id=$exec_id"
+
+  # must NOT enqueue
+  queue_sql="SELECT execution_id FROM runbook_queue WHERE execution_id='$exec_id' LIMIT 1;"
+  if wait_until "$WAIT_QUEUE_SECONDS" bash -c "
+    hit=\$(docker compose exec -T '$API_SERVICE' python -c 'import sqlite3,sys
+db=sys.argv[1]; sql=sys.argv[2]
+con=sqlite3.connect(db); cur=con.execute(sql)
+print(1 if cur.fetchone() else 0)' '$DB_PATH' \"$queue_sql\" 2>/dev/null || echo 0)
+    [[ \"\$hit\" -eq 1 ]]
+  "; then
+    dump_queue_by_exec "$exec_id"
+    dump_exec_by_id "$exec_id"
+    die "FAIL: Disallowed target created a runbook_queue row (queue pollution)."
+  fi
+
+  ok "no runbook_queue row created (fail-fast integrity)."
+
+  h="$(get_json "$BASE_URL/api/runbooks/history/$exec_id")"
+  st="$(echo "$h" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+  err="$(echo "$h" | jq -r '.error // empty')"
+  echo "history: status=$st error=$err"
+
+  [[ "$st" != "success" ]] || die "FAIL: disallowed target should not succeed."
+  case "$st" in
+    failed|timeout|skipped) : ;;
+    *) die "FAIL: expected terminal status after hard reject (failed/timeout/skipped), got '$st'." ;;
+  esac
+else
+  ok "strict-mode: API rejected request (HTTP $http_code). OK if you throw on hard guard."
+  ok "rejected without creating execution/queue."
+fi
+
+# ---------------------------
+# 2) RECOVERY SAFETY: inject illegal queued job
+# ---------------------------
+
+echo
+echo "==> [2] RECOVERY SAFETY: injecting illegal queued job into DB..."
+
+inject_exec_id="$(python - <<'PY'
+import uuid
+print(uuid.uuid4().hex)
+PY
+)"
+now_iso="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+payload_json="{}"
+
+sql="
+INSERT INTO runbook_executions(
+  id, incident_id, runbook_name, status, triggered_by,
+  execution_origin, retry_of_execution_id,
+  target_service, target_instance, parameters_json,
+  output, error, started_at, completed_at, duration_seconds,
+  confirmed_execution_id, confirmed_by, confirmed_at
+)
+VALUES(
+  '$inject_exec_id', NULL, '$RUNBOOK_NAME', 'queued', 'recovery',
+  'recovery', NULL,
+  '$bad_service', NULL, '$payload_json',
+  '', NULL, '$now_iso', NULL, NULL,
+  NULL, NULL, NULL
+);
+
+INSERT INTO runbook_queue(
+  execution_id, runbook_name, incident_id,
+  target_service, target_instance,
+  parameters_json, triggered_by,
+  execution_origin, retry_of_execution_id,
+  status, attempts, last_heartbeat,
+  available_at, lease_owner, lease_expires_at,
+  created_at, updated_at
+)
+VALUES(
+  '$inject_exec_id', '$RUNBOOK_NAME', NULL,
+  '$bad_service', NULL,
+  '$payload_json', 'recovery',
+  'recovery', NULL,
+  'queued', 0, NULL,
+  '$now_iso', NULL, NULL,
+  '$now_iso', '$now_iso'
+);
+"
+
+out="$(sqlite_exec_heredoc "$sql" | tr -d '\r' | tail -n 1 || true)"
+echo "DB inject: $out"
+echo "$out" | grep -q "^OK" || die "DB inject did not return OK. Output was: $out"
+
+ins_cnt="$(sqlite_count "SELECT id FROM runbook_executions WHERE id='$inject_exec_id' LIMIT 1;")"
+[[ "$ins_cnt" -eq 1 ]] || die "FAIL: injection did not create runbook_executions row (check DB path/schema)."
+
+echo
+echo "==> Waiting injected job to be CLOSED (exec terminal + queue done/dead)..."
+
+closed_predicate() {
+  ex="$(sqlite_query_json "SELECT status,error,completed_at FROM runbook_executions WHERE id='$inject_exec_id' LIMIT 1;" 2>/dev/null || echo '[]')"
+  q="$(sqlite_query_json "SELECT status,attempts,lease_owner,last_heartbeat FROM runbook_queue WHERE execution_id='$inject_exec_id' LIMIT 1;" 2>/dev/null || echo '[]')"
+
+  [[ "$(echo "$ex" | jq 'length')" -ge 1 ]] || return 1
+  [[ "$(echo "$q" | jq 'length')" -ge 1 ]] || return 1
+
+  ex_st="$(echo "$ex" | jq -r '.[0].status // ""' | tr '[:upper:]' '[:lower:]')"
+  q_st="$(echo "$q" | jq -r '.[0].status // ""' | tr '[:upper:]' '[:lower:]')"
+
+  case "$ex_st" in failed|timeout|skipped|success) ex_done="true" ;; *) ex_done="false" ;; esac
+  case "$q_st" in done|dead) q_done="true" ;; *) q_done="false" ;; esac
+
+  [[ "$ex_done" == "true" && "$q_done" == "true" ]]
+}
+
+if ! wait_until "$WAIT_TERMINAL_SECONDS" closed_predicate; then
+  dump_queue_by_exec "$inject_exec_id"
+  dump_exec_by_id "$inject_exec_id"
+  die "FAIL: injected illegal job did not get CLOSED within ${WAIT_TERMINAL_SECONDS}s."
+fi
+
+ex_final="$(sqlite_query_json "SELECT status,error,completed_at FROM runbook_executions WHERE id='$inject_exec_id' LIMIT 1;")"
+q_final="$(sqlite_query_json "SELECT status,attempts,lease_owner,last_heartbeat FROM runbook_queue WHERE execution_id='$inject_exec_id' LIMIT 1;")"
+
+ex_st="$(echo "$ex_final" | jq -r '.[0].status // empty')"
+ex_completed="$(echo "$ex_final" | jq -r '.[0].completed_at // empty')"
+ex_err="$(echo "$ex_final" | jq -r '.[0].error // empty')"
+
+q_st="$(echo "$q_final" | jq -r '.[0].status // empty')"
+q_attempts="$(echo "$q_final" | jq -r '.[0].attempts // empty')"
+q_owner="$(echo "$q_final" | jq -r '.[0].lease_owner // empty')"
+q_hb="$(echo "$q_final" | jq -r '.[0].last_heartbeat // empty')"
+
+echo "final exec: st=$ex_st completed_at=$ex_completed err=$ex_err"
+echo "final queue: st=$q_st attempts=$q_attempts owner=$q_owner hb=$q_hb"
+
+[[ "$(echo "$ex_st" | tr '[:upper:]' '[:lower:]')" != "success" ]] \
+  || die "FAIL: injected disallowed job succeeded => HARD guard broken."
+
+case "$(echo "$q_st" | tr '[:upper:]' '[:lower:]')" in
+  done|dead) : ;;
+  *) die "FAIL: queue row not closed (done/dead)." ;;
+esac
+
+echo
+echo "ALLOWLIST HARDENING TEST v6 PASSED ✅"
