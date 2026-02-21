@@ -1,0 +1,218 @@
+TEST 1 — E2E Confirm + Audit + Persistence + Restart
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================================
+# TEST 1 — E2E Confirm + Audit + Persistence + Restart
+# Webhook → incident; pending; stale cancel → skipped;
+# confirm; persist confirmed_*; restart y re-check.
+# Audit opcional (SKIP si no hay log host)
+# =========================================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+RUNBOOK="${RUNBOOK:-restart_service}"
+TARGET_SERVICE="${TARGET_SERVICE:-frontend}"
+
+# Si tu audit log está en host, pon la ruta correcta.
+# Si no existe, el test hace SKIP de las comprobaciones de audit.
+AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-./logs/audit.log}"
+
+MIN_AGE_SECONDS_FOR_STALE_CANCEL="${MIN_AGE_SECONDS_FOR_STALE_CANCEL:-5}"
+STALE_CANCEL_LIMIT="${STALE_CANCEL_LIMIT:-200}"
+SLEEP_BEFORE_STALE_CANCEL_SEC="${SLEEP_BEFORE_STALE_CANCEL_SEC:-6}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+assert_true() { [[ "$1" == "true" ]] || die "$2"; }
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+assert_equals() { [[ "$1" == "$2" ]] || die "$3 (expected=$2 got=$1)"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-25}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable at $url after ${seconds}s"
+}
+
+find_audit_line() {
+  local execution_id="$1"
+  local tail="${2:-2000}"
+  [[ -f "$AUDIT_LOG_PATH" ]] || return 0
+  tail -n "$tail" "$AUDIT_LOG_PATH" | grep -F "$execution_id" | tail -n 1 || true
+}
+
+echo "==> Waiting API up..."
+wait_http "$BASE_URL/health" 25
+
+# -------------------------
+# 1) Crear incidente via webhook
+# -------------------------
+now="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+fp="fp-e2e-$(openssl rand -hex 4 2>/dev/null || uuidgen | tr -d '-' | head -c8)"
+
+webhook_payload="$(jq -n \
+  --arg now "$now" \
+  --arg fp "$fp" \
+  --arg svc "$TARGET_SERVICE" \
+  '{
+    status:"firing",
+    receiver:"test",
+    groupKey:"test-e2e",
+    groupLabels:{alertname:"HighCPU", service:$svc, severity:"warning"},
+    commonLabels:{alertname:"HighCPU", service:$svc, severity:"warning"},
+    commonAnnotations:{summary:"E2E", description:"created by e2e test"},
+    externalURL:"http://localhost",
+    version:"4",
+    alerts:[{
+      status:"firing",
+      labels:{alertname:"HighCPU", service:$svc, severity:"warning"},
+      annotations:{summary:"High CPU", description:"e2e test"},
+      startsAt:$now,
+      endsAt:null,
+      generatorURL:"http://example",
+      fingerprint:$fp
+    }]
+  }')"
+
+wh_resp="$(curl -fsS -X POST \
+  -H "Content-Type: application/json" \
+  -d "$webhook_payload" \
+  "$BASE_URL/webhook/alertmanager")"
+
+incident_id="$(echo "$wh_resp" | jq -r '.data.incidents[0].id // empty')"
+assert_nonempty "$incident_id" "Expected incident id from webhook response"
+echo "OK incidentId=$incident_id"
+
+# -------------------------
+# 2) Crear ejecución => debe quedar PENDING
+# -------------------------
+start_body="$(jq -n --arg iid "$incident_id" --arg svc "$TARGET_SERVICE" '{incident_id:$iid, target_service:$svc}')"
+
+resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$start_body" \
+  "$BASE_URL/api/runbooks/$RUNBOOK")"
+
+execution_id="$(echo "$resp" | jq -r '.execution_id // empty')"
+assert_nonempty "$execution_id" "Expected execution_id in runbook start response"
+echo "OK pending executionId=$execution_id"
+
+hist="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$execution_id")"
+status="$(echo "$hist" | jq -r '.status // ""' | tr '[:upper:]' '[:lower:]')"
+assert_equals "$status" "pending" "Expected execution status pending"
+echo "OK history pending"
+
+# -------------------------
+# 3) Audit: pending_created (si audit está en host)
+# -------------------------
+if [[ -f "$AUDIT_LOG_PATH" ]]; then
+  sleep 0.3
+  line="$(find_audit_line "$execution_id" 2500)"
+  assert_nonempty "$line" "Expected audit line containing executionId=$execution_id"
+  echo "$line" | grep -Eq '"action"\s*:\s*"pending_created"' \
+    || die "Expected audit action=pending_created. Line: $line"
+  echo "OK audit pending_created"
+else
+  echo "SKIP audit pending_created: no audit log at $AUDIT_LOG_PATH (mount it if you want this check)"
+fi
+
+# -------------------------
+# 4) Stale cancel via endpoint => SKIPPED + completed_at + audit action
+# -------------------------
+sleep "$SLEEP_BEFORE_STALE_CANCEL_SEC"
+
+stale_url="$BASE_URL/api/runbooks/pending/stale?min_age_seconds=$MIN_AGE_SECONDS_FOR_STALE_CANCEL&action=cancel&limit=$STALE_CANCEL_LIMIT"
+cancel="$(curl -fsS -H "$AUTH_HEADER" "$stale_url")"
+canceled="$(echo "$cancel" | jq -r '.canceled // 0')"
+
+# jq devuelve número; comparamos aritméticamente
+[[ "$canceled" -ge 1 ]] || die "Expected at least 1 canceled pending via stale endpoint"
+echo "OK stale endpoint canceled=$canceled"
+
+hist2="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$execution_id")"
+status2="$(echo "$hist2" | jq -r '.status // ""' | tr '[:upper:]' '[:lower:]')"
+completed_at="$(echo "$hist2" | jq -r '.completed_at // empty')"
+assert_equals "$status2" "skipped" "Expected status=skipped after stale cancel"
+assert_nonempty "$completed_at" "Expected completed_at after stale cancel"
+echo "OK stale cancel -> skipped + completed_at"
+
+if [[ -f "$AUDIT_LOG_PATH" ]]; then
+  sleep 0.3
+  hit="$(find_audit_line "$execution_id" 4000)"
+  assert_nonempty "$hit" "Expected audit line containing executionId=$execution_id after stale cancel"
+  echo "$hit" | grep -Eq '"action"\s*:\s*"pending_skipped_stale_endpoint"' \
+    || die "Expected audit action=pending_skipped_stale_endpoint. Line: $hit"
+  echo "OK audit stale cancel"
+else
+  echo "SKIP audit stale cancel: no audit log at $AUDIT_LOG_PATH"
+fi
+
+# -------------------------
+# 5) Confirm flow => confirmed_* persistido en el PENDING
+# -------------------------
+resp_p="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$start_body" \
+  "$BASE_URL/api/runbooks/$RUNBOOK")"
+
+pending_id="$(echo "$resp_p" | jq -r '.execution_id // empty')"
+assert_nonempty "$pending_id" "Expected new pending execution id"
+echo "OK new pendingId=$pending_id"
+
+confirm_body="$(jq -n '{parameters:{}}')"
+confirm_resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$confirm_body" \
+  "$BASE_URL/api/incidents/$incident_id/runbooks/$pending_id/confirm")"
+
+confirmed_id="$(echo "$confirm_resp" | jq -r '.confirmed_execution_id // empty')"
+assert_nonempty "$confirmed_id" "Expected confirmed_execution_id in confirm response"
+echo "OK confirmedExecutionId=$confirmed_id"
+
+pending_hist="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$pending_id")"
+persist_confirmed_id="$(echo "$pending_hist" | jq -r '.confirmed_execution_id // empty')"
+confirmed_by="$(echo "$pending_hist" | jq -r '.confirmed_by // empty')"
+confirmed_at="$(echo "$pending_hist" | jq -r '.confirmed_at // empty')"
+
+assert_equals "$persist_confirmed_id" "$confirmed_id" "Expected pending row to persist confirmed_execution_id"
+assert_nonempty "$confirmed_by" "Expected pending row to persist confirmed_by"
+assert_nonempty "$confirmed_at" "Expected pending row to persist confirmed_at"
+echo "OK confirmed_* persisted on pending execution row"
+
+# -------------------------
+# 6) Restart + re-check persistence
+# -------------------------
+echo "==> Restarting stack..."
+docker compose restart >/dev/null
+sleep 3
+wait_http "$BASE_URL/health" 25
+
+pending_hist2="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/history/$pending_id")"
+persist_confirmed_id2="$(echo "$pending_hist2" | jq -r '.confirmed_execution_id // empty')"
+confirmed_by2="$(echo "$pending_hist2" | jq -r '.confirmed_by // empty')"
+confirmed_at2="$(echo "$pending_hist2" | jq -r '.confirmed_at // empty')"
+
+assert_equals "$persist_confirmed_id2" "$confirmed_id" "After restart: confirmed_execution_id should persist"
+assert_nonempty "$confirmed_by2" "After restart: confirmed_by should persist"
+assert_nonempty "$confirmed_at2" "After restart: confirmed_at should persist"
+echo "OK confirmed_* survives restart"
+
+QUE HACE: 
+
+crea incidente por webhook, 
+crea pending, 
+(opcional) verifica audit pending_created, 
+fuerza stale cancel y valida que queda skipped con completed_at (y audit si hay log), 
+luego crea otro pending, lo confirma, verifica que confirmed_* queda persistido en el pending y sobrevive a un docker compose restart.
