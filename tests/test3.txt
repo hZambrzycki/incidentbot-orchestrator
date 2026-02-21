@@ -1,0 +1,92 @@
+TEST 3 — Stale counters consistency: Prometheus vs /queue/state
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================================
+# TEST 3 — Stale counters consistency: Prometheus vs /queue/state
+# pending_stale_total{threshold=5} y queue/state coinciden
+# =========================================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+METRICS_URL="${METRICS_URL:-$BASE_URL/metrics}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+RUNBOOK="${RUNBOOK:-restart_service}"
+TARGET_SERVICE="${TARGET_SERVICE:-frontend}"
+
+THRESHOLD_SECONDS="${THRESHOLD_SECONDS:-5}"
+SLEEP_TO_BECOME_STALE_SECONDS="${SLEEP_TO_BECOME_STALE_SECONDS:-6}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-25}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable at $url after ${seconds}s"
+}
+
+echo "==> Waiting API up..."
+wait_http "$BASE_URL/health" 25
+
+# 1) crear pending
+incident_id="test-stale-$(uuidgen | tr -d '-')"
+body="$(jq -n \
+  --arg iid "$incident_id" \
+  --arg svc "$TARGET_SERVICE" \
+  '{incident_id:$iid, target_service:$svc, triggered_by:"system"}')"
+
+resp="$(curl -fsS -X POST \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d "$body" \
+  "$BASE_URL/api/runbooks/$RUNBOOK")"
+
+status="$(echo "$resp" | jq -r '.status // empty')"
+[[ "$status" == "pending" ]] || die "Expected pending, got $status"
+
+execution_id="$(echo "$resp" | jq -r '.execution_id // empty')"
+assert_nonempty "$execution_id" "Missing execution_id"
+echo "OK pending executionId=$execution_id"
+
+# 2) esperar a stale
+sleep "$SLEEP_TO_BECOME_STALE_SECONDS"
+
+# 3) métrica stale_total{threshold="5"} >= 1
+metrics="$(curl -fsS "$METRICS_URL")"
+
+# Busca la línea exacta del timeseries con threshold="5"
+stale_metric="$(echo "$metrics" | awk '
+  $1 ~ /^incident_bot_runbooks_pending_stale_total\{threshold="5"\}$/ {print $2; exit}
+')"
+
+assert_nonempty "$stale_metric" "Metric pending_stale_total threshold=5 not found"
+
+# stale_metric puede ser float; lo comparamos como número
+awk -v v="$stale_metric" 'BEGIN{ exit !(v >= 1) }' || die "Expected stale_total{threshold=5} >= 1, got $stale_metric"
+
+# 4) endpoint queue/state coherente
+qs="$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/runbooks/queue/state?include_samples=true")"
+
+# asumimos shape: qs.pending_stale_total."5"
+stale_from_queue="$(echo "$qs" | jq -r --arg t "$THRESHOLD_SECONDS" '.pending_stale_total[$t] // empty')"
+assert_nonempty "$stale_from_queue" "queue/state missing pending_stale_total['$THRESHOLD_SECONDS']"
+
+awk -v v="$stale_from_queue" 'BEGIN{ exit !(v >= 1) }' || die "Expected queue_state stale_total['$THRESHOLD_SECONDS'] >= 1, got $stale_from_queue"
+
+pending_total="$(echo "$qs" | jq -r '.totals.pending // empty')"
+echo "OK metric_stale_5=$stale_metric queue_state_stale_5=$stale_from_queue pending_total=$pending_total"
+
+QUE HACE:
+crea un pending, espera >5s, 
+comprueba que Prometheus incrementa pending_stale_total{threshold="5"}, 
+y comprueba que /api/runbooks/queue/state refleja el mismo “stale >= 1” para el umbral 5.
