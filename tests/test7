@@ -1,0 +1,292 @@
+1) SRE Advanced Recovery Test v6 (paste-safe)
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================================
+# SRE Advanced Recovery Test v6 (paste-safe)
+# - Ensures restart_service is PENDING (confirmable)
+# - /confirm creates runbook_confirmations
+# - HARD REQUIREMENT: /confirm enqueues confirmed exec into runbook_queue
+# - Optionally observes lease/heartbeat
+# - Confirms confirmed execution reaches terminal state (worker path)
+# DB-aware via python sqlite3 inside container
+# =========================================
+
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+TOKEN="${TOKEN:-}"
+AUTH_HEADER="Authorization: Bearer ${TOKEN}"
+
+API_SERVICE="${API_SERVICE:-incident-bot}"
+DB_PATH="${DB_PATH:-/data/incident-bot.sqlite3}"
+
+WAIT_API_SECONDS="${WAIT_API_SECONDS:-30}"
+WAIT_CONFIRM_ROW_SECONDS="${WAIT_CONFIRM_ROW_SECONDS:-15}"
+WAIT_QUEUE_ROW_SECONDS="${WAIT_QUEUE_ROW_SECONDS:-20}"
+WAIT_LEASE_SECONDS="${WAIT_LEASE_SECONDS:-20}"
+TERMINAL_WAIT_SECONDS="${TERMINAL_WAIT_SECONDS:-90}"
+
+RUNBOOK_NAME="${RUNBOOK_NAME:-restart_service}"
+TARGET_SERVICE="${TARGET_SERVICE:-frontend}"
+
+HEALTH_URL="${HEALTH_URL:-$BASE_URL/api/health}"
+
+die() { echo "❌ $*" >&2; exit 1; }
+warn() { echo "⚠️  $*" >&2; }
+ok() { echo "OK $*"; }
+
+assert_nonempty() { [[ -n "${1:-}" ]] || die "$2"; }
+
+wait_http() {
+  local url="$1"
+  local seconds="${2:-30}"
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if curl -fsS -H "$AUTH_HEADER" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Service not reachable: $url"
+}
+
+# wait_until <seconds> <command...>
+wait_until() {
+  local seconds="$1"; shift
+  local deadline=$((SECONDS + seconds))
+  while (( SECONDS < deadline )); do
+    if "$@"; then return 0; fi
+    sleep 0.75
+  done
+  return 1
+}
+
+# ---------- DB helpers (python sqlite3 inside container) ----------
+
+sqlite_query_json() {
+  local sql="$1"
+  local py='import json,sqlite3,sys
+db_path=sys.argv[1]
+sql=sys.argv[2]
+con=sqlite3.connect(db_path)
+con.row_factory=sqlite3.Row
+rows=[dict(r) for r in con.execute(sql).fetchall()]
+print(json.dumps(rows))'
+  docker compose exec -T "$API_SERVICE" python -c "$py" "$DB_PATH" "$sql"
+}
+
+sqlite_count() {
+  local sql="$1"
+  local raw
+  raw="$(sqlite_query_json "$sql" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || { echo 0; return 0; }
+  echo "$raw" | jq 'length'
+}
+
+dump_latest_queue() {
+  local incident_id="$1"
+  echo
+  echo "--- DB dump: runbook_queue rows for incident $incident_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT execution_id,runbook_name,status,incident_id,attempts,available_at,last_heartbeat,lease_owner,lease_expires_at,retry_of_execution_id,created_at
+                             FROM runbook_queue WHERE incident_id='$incident_id'
+                             ORDER BY created_at DESC LIMIT 20;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[] |
+    "- exec=\(.execution_id) rb=\(.runbook_name) st=\(.status) att=\(.attempts) avail=\(.available_at) hb=\(.last_heartbeat) owner=\(.lease_owner) exp=\(.lease_expires_at) retry_of=\(.retry_of_execution_id)"'
+}
+
+dump_confirm_row() {
+  local pending_id="$1"
+  echo
+  echo "--- DB dump: runbook_confirmations for pending $pending_id ---"
+  local rows
+  rows="$(sqlite_query_json "SELECT pending_execution_id,incident_id,runbook_name,actor_id,status,confirmed_execution_id,created_at,updated_at
+                             FROM runbook_confirmations WHERE pending_execution_id='$pending_id' LIMIT 5;" 2>/dev/null || true)"
+  if [[ -z "$rows" ]] || [[ "$(echo "$rows" | jq 'length')" -eq 0 ]]; then
+    echo "(none)"
+    return 0
+  fi
+  echo "$rows" | jq -r '.[] |
+    "- pending=\(.pending_execution_id) st=\(.status) confirmed=\(.confirmed_execution_id) actor=\(.actor_id) created=\(.created_at) updated=\(.updated_at)"'
+}
+
+# ---------- HTTP helpers ----------
+
+post_json() {
+  local url="$1"
+  local body="$2"
+  curl -fsS -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$body" "$url"
+}
+
+get_json() {
+  local url="$1"
+  curl -fsS -H "$AUTH_HEADER" "$url"
+}
+
+# =========================================
+# Preflight
+# =========================================
+
+echo
+echo "==> Waiting API..."
+wait_http "$HEALTH_URL" "$WAIT_API_SECONDS"
+
+echo
+echo "==> Checking DB presence..."
+db_ls="$(docker compose exec -T "$API_SERVICE" sh -lc "ls -lah '$DB_PATH' || true")"
+echo "$db_ls" | grep -q "incident-bot\.sqlite3" || die "DB file not found at $DB_PATH"
+ok "DB present: $DB_PATH"
+
+# 0) Create incident via Alertmanager webhook (no auth)
+echo
+echo "==> Creating incident via Alertmanager webhook..."
+fp="fp-sre-adv-$(openssl rand -hex 4 2>/dev/null || uuidgen | tr -d '-' | head -c8)"
+now="$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")"
+
+webhook_payload="$(jq -n \
+  --arg fp "$fp" \
+  --arg now "$now" \
+  --arg svc "$TARGET_SERVICE" \
+  '{
+    status:"firing", receiver:"test", groupKey:"test",
+    groupLabels:{alertname:"HighCPU", service:$svc},
+    commonLabels:{alertname:"HighCPU", service:$svc},
+    commonAnnotations:{summary:"SRE advanced recovery test v6"},
+    externalURL:"http://localhost", version:"4",
+    alerts:[{
+      status:"firing",
+      labels:{alertname:"HighCPU", service:$svc},
+      annotations:{summary:"SRE advanced recovery test v6"},
+      startsAt:$now,
+      fingerprint:$fp
+    }]
+  }')"
+
+res="$(curl -fsS -X POST -H "Content-Type: application/json" -d "$webhook_payload" \
+  "$BASE_URL/webhook/alertmanager")"
+
+incident_id="$(echo "$res" | jq -r '.data.incidents[0].id // empty')"
+assert_nonempty "$incident_id" "Incident creation failed"
+ok "incident=$incident_id"
+
+# 1) Create pending
+echo
+echo "==> Creating PENDING execution ($RUNBOOK_NAME)..."
+pending_body="$(jq -n --arg iid "$incident_id" --arg svc "$TARGET_SERVICE" '{incident_id:$iid, target_service:$svc}')"
+pending_resp="$(post_json "$BASE_URL/api/runbooks/$RUNBOOK_NAME" "$pending_body")"
+pending_id="$(echo "$pending_resp" | jq -r '.execution_id // empty')"
+assert_nonempty "$pending_id" "Pending creation failed"
+ok "created pending=$pending_id"
+
+pend_hist="$(get_json "$BASE_URL/api/runbooks/history/$pending_id")"
+pend_status="$(echo "$pend_hist" | jq -r '.status // empty')"
+echo "pending check: status=$pend_status"
+
+if [[ "$pend_status" != "pending" ]]; then
+  dump_latest_queue "$incident_id"
+  die "FAIL: $RUNBOOK_NAME did NOT produce PENDING (got '$pend_status'). Ensure requires_confirmation=True."
+fi
+
+# 2) Confirm pending
+echo
+echo "==> Confirming pending execution..."
+confirm_body='{"parameters":{}}'
+confirm_resp="$(post_json "$BASE_URL/api/incidents/$incident_id/runbooks/$pending_id/confirm" "$confirm_body")"
+confirmed_id="$(echo "$confirm_resp" | jq -r '.confirmed_execution_id // empty')"
+assert_nonempty "$confirmed_id" "Confirm failed (no confirmed_execution_id)"
+ok "confirmed execution=$confirmed_id"
+
+# 2a) Confirmations row exists
+echo
+echo "==> Waiting for runbook_confirmations row..."
+confirm_sql="SELECT pending_execution_id,status,confirmed_execution_id
+             FROM runbook_confirmations WHERE pending_execution_id='$pending_id' LIMIT 1;"
+
+if ! wait_until "$WAIT_CONFIRM_ROW_SECONDS" bash -c "
+  cnt=\$(docker compose exec -T '$API_SERVICE' python -c 'import sqlite3,sys
+db=sys.argv[1]; sql=sys.argv[2]
+con=sqlite3.connect(db); cur=con.execute(sql)
+print(1 if cur.fetchone() else 0)' '$DB_PATH' \"$confirm_sql\" 2>/dev/null || echo 0)
+  [[ \"\$cnt\" -eq 1 ]]
+"; then
+  dump_confirm_row "$pending_id"
+  die "FAIL: runbook_confirmations row not created for pending_execution_id=$pending_id"
+fi
+
+dump_confirm_row "$pending_id"
+
+# 3) HARD REQUIREMENT: confirmed must be in runbook_queue
+echo
+echo "==> Waiting for runbook_queue row for confirmed execution..."
+queue_sql="SELECT execution_id,status,runbook_name,available_at
+           FROM runbook_queue WHERE execution_id='$confirmed_id' LIMIT 1;"
+
+if ! wait_until "$WAIT_QUEUE_ROW_SECONDS" bash -c "
+  cnt=\$(docker compose exec -T '$API_SERVICE' python -c 'import sqlite3,sys
+db=sys.argv[1]; sql=sys.argv[2]
+con=sqlite3.connect(db); cur=con.execute(sql)
+print(1 if cur.fetchone() else 0)' '$DB_PATH' \"$queue_sql\" 2>/dev/null || echo 0)
+  [[ \"\$cnt\" -eq 1 ]]
+"; then
+  dump_latest_queue "$incident_id"
+  dump_confirm_row "$pending_id"
+  h=\"\$(curl -fsS -H '$AUTH_HEADER' '$BASE_URL/api/runbooks/history/$confirmed_id')\"
+  st=\"\$(echo \"\$h\" | jq -r '.status // empty')\"
+  sa=\"\$(echo \"\$h\" | jq -r '.started_at // empty')\"
+  ca=\"\$(echo \"\$h\" | jq -r '.completed_at // empty')\"
+  echo
+  echo \"API history for confirmed: status=\$st started_at=\$sa completed_at=\$ca\"
+  die "FAIL: Confirmed execution did NOT create a queue row (confirm executed inline instead of enqueue)."
+fi
+
+q1="$(sqlite_query_json "SELECT execution_id,status,lease_owner,lease_expires_at,available_at,last_heartbeat,attempts
+                         FROM runbook_queue WHERE execution_id='$confirmed_id' LIMIT 1;")"
+echo "$q1" | jq -r '.[0] |
+  "OK queue row: exec=\(.execution_id) status=\(.status) attempts=\(.attempts) owner=\(.lease_owner) exp=\(.lease_expires_at) avail=\(.available_at) hb=\(.last_heartbeat)"'
+
+# 4) Optional: observe lease/heartbeat
+echo
+echo "==> Waiting for lease_owner or heartbeat (optional)..."
+
+lease_predicate() {
+  x="$(sqlite_query_json "SELECT lease_owner,last_heartbeat,status FROM runbook_queue WHERE execution_id='$confirmed_id' LIMIT 1;" 2>/dev/null || echo '[]')"
+  [[ "$(echo "$x" | jq 'length')" -ge 1 ]] || return 1
+  owner="$(echo "$x" | jq -r '.[0].lease_owner // ""')"
+  hb="$(echo "$x" | jq -r '.[0].last_heartbeat // ""')"
+  st="$(echo "$x" | jq -r '.[0].status // ""')"
+  [[ -n "$owner" || -n "$hb" || "$st" == "running" ]]
+}
+
+if wait_until "$WAIT_LEASE_SECONDS" lease_predicate; then
+  x="$(sqlite_query_json "SELECT status,lease_owner,lease_expires_at,last_heartbeat
+                          FROM runbook_queue WHERE execution_id='$confirmed_id' LIMIT 1;")"
+  echo "$x" | jq -r '.[0] |
+    "OK lease/heartbeat observed: st=\(.status) owner=\(.lease_owner) exp=\(.lease_expires_at) hb=\(.last_heartbeat)"'
+else
+  warn "lease/heartbeat not observed within ${WAIT_LEASE_SECONDS}s (may be OK if run finished very fast)."
+fi
+
+# 5) Wait terminal state of confirmed execution
+echo
+echo "==> Waiting for confirmed execution terminal state..."
+
+if ! wait_until "$TERMINAL_WAIT_SECONDS" bash -c "
+  s=\$(curl -fsS -H '$AUTH_HEADER' '$BASE_URL/api/runbooks/history/$confirmed_id' | jq -r '.status // empty')
+  case \"\$s\" in skipped|failed|success|timeout) exit 0 ;; *) exit 1 ;; esac
+"; then
+  dump_latest_queue "$incident_id"
+  c="$(get_json "$BASE_URL/api/runbooks/history/$confirmed_id")"
+  st="$(echo "$c" | jq -r '.status // empty')"
+  die "FAIL: Execution did not reach terminal state in ${TERMINAL_WAIT_SECONDS}s. Current status=$st"
+fi
+
+c="$(get_json "$BASE_URL/api/runbooks/history/$confirmed_id")"
+final_status="$(echo "$c" | jq -r '.status // empty')"
+ok "terminal status=$final_status"
+
+echo
+echo "SRE ADVANCED RECOVERY TEST v6 PASSED ✅"
