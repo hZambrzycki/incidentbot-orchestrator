@@ -9,6 +9,7 @@
 - [API Endpoints](#api-endpoints)
 - [Observability](#observability)
 - [Summary](#summary)
+- [TESTS](#tests)
 
 ---
 
